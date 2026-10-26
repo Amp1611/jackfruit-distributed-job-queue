@@ -20,6 +20,15 @@ logs/        scheduler.log worker1.log worker2.log          (created at run time
 IPs 10.0.0.1-4. Two paths between s1 and s3 (direct, or via s2).
 Job traffic that crosses the backbone: scheduler (h2) <-> workers (h3, h4).
 
+## Prerequisites (Ubuntu VM)
+Mininet and Open vSwitch must be installed (we used Mininet 2.3.0 and Open vSwitch 3.7.1), for example: sudo apt install mininet openvswitch-switch
+The Ryu controller needs Python 3.9 in a virtual environment. Ryu 4.34 does not work with newer system Pythons, so create the venv with uv:
+  curl -LsSf https://astral.sh/uv/install.sh | sh
+  uv venv --python 3.9 venv
+  source venv/bin/activate
+  uv pip install ryu==4.34 eventlet==0.30.2 dnspython==1.16.0
+The topology and the app use only the standard library and system Python (sudo python3), not the venv.
+
 ## Run order (3 terminals), always from ~/sdn-project
 **Terminal 1 - controller**
 ```bash
