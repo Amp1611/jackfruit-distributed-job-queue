@@ -54,7 +54,7 @@ If a run is interrupted: `sudo mn -c` before starting again.
 | 11 | **Dynamic path change** | Terminal 3: `echo via_s2 > /tmp/sdn_path`, then run test 4 again | Terminal 1 prints `PATH CHANGE`; job traffic now appears on s2; back with `echo direct > /tmp/sdn_path` |
 | 12 | Worker failure (bonus) | `h3 pkill -f worker.py` while running test 5 | scheduler log: worker removed, jobs requeued, all jobs still finish |
 
-## How the app and SDN are integrated (for the 3 integration marks)
+## How the app and SDN are integrated
 1. The controller gives the job-queue port (TCP 5000) its own high-priority flow rules, so application traffic is identified and counted in the network, per switch.
 2. The scheduler publishes worker/queue state to `/tmp/sdn_status.json`; the controller reads it and prints it next to the traffic counters.
 3. The controller changes the switch-to-switch path at run time (`/tmp/sdn_path`). D2 will drive this automatically from worker failure and load.
