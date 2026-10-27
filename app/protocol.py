@@ -1,120 +1,78 @@
 """
-protocol.py - Shared message protocol for the Distributed Job Queue project.
+protocol.py - shared helpers for the line-based job-queue protocol (Member 1).
 
-Used by: scheduler.py (Member 1), worker.py / client.py (Member 2).
-Member 3's Ryu controller does NOT use TCP; it reads the status file
-(see scheduler.py) whose layout is documented there.
+Implements docs/protocol.md. Used by scheduler.py, worker.py and client.py:
+    from protocol import PORT, send_line, log
 
 FRAMING
-    Every message is ONE JSON object on ONE line, terminated by "\\n",
-    encoded as UTF-8. Max line size: MAX_MESSAGE_BYTES (1 MiB).
-    json.dumps(ensure_ascii=True) never emits a raw newline, so "\\n"
-    is a safe delimiter.
+    One message per line, UTF-8, ended by "\\n", TCP port 5000.
+    A line is "VERB arg arg ...". Only the LAST argument may contain spaces.
 
-ENVELOPE
-    {"type": "<MESSAGE_TYPE>", ...fields...}
+MESSAGES THE SCHEDULER ACCEPTS (parsed by parse_message)
+    SUBMIT <TYPE> <payload>            client  -> scheduler
+    PING / QUIT                        client  -> scheduler
+    REGISTER <worker_id>               worker  -> scheduler
+    HEARTBEAT <worker_id> <active>     worker  -> scheduler (every 2 s)
+    DONE <job_id> <output>             worker  -> scheduler
+    FAIL <job_id> <reason>             worker  -> scheduler
 
-MESSAGES (direction: fields) - "?" marks an optional field
-    CLIENT -> SCHEDULER
-      SUBMIT_JOB       job_type:str, payload:dict, client_id?:str
-      GET_JOB_STATUS   job_id:int
-    ANYONE -> SCHEDULER
-      GET_STATUS       (no fields)   - returns a STATUS snapshot
-    SCHEDULER -> CLIENT
-      JOB_ACK          job_id:int, status:str ("QUEUED")
-      JOB_STATUS       job_id:int, status:str, result, error, worker_id, attempts
-      JOB_RESULT       job_id:int, status:str ("DONE"|"FAILED"), result, error,
-                       worker_id, attempts       (pushed when the job finishes)
-      STATUS           full snapshot (same content as the status file)
-    WORKER -> SCHEDULER
-      REGISTER_WORKER  worker_id:str, capacity?:int (default 1)
-      HEARTBEAT        worker_id:str
-      WORKER_RESULT    worker_id:str, job_id:int, status:str ("DONE"|"FAILED"),
-                       result?, error?
-    SCHEDULER -> WORKER
-      REGISTER_ACK     worker_id:str, heartbeat_interval:number,
-                       heartbeat_timeout:number
-      HEARTBEAT_ACK    worker_id:str
-      ASSIGN_JOB       job_id:int, job_type:str, payload:dict, attempt:int
-    SCHEDULER -> ANYONE
-      ERROR            code:str, message:str
+MESSAGES THE SCHEDULER SENDS
+    ACK <job_id>                       job accepted and queued
+    RESULT <job_id> <output>           job finished
+    FAILED <job_id> <reason>           job failed
+    ERROR <reason>                     bad request
+    PONG                               reply to PING (not in docs/protocol.md)
+    REGISTERED <worker_id>             registration accepted
+    JOB <job_id> <TYPE> <payload>      run this job
 
-JOB TYPES (payload)
-    factorial  {"n": int 0..100000}     (return a SMALL result, e.g. digit
-                                        count - not the full number)
-    reverse    {"text": str}
-    echo       {"text": str}
-    sleep      {"seconds": number 0..60}
+JOB TYPES: REVERSE <text>, SUM <numbers>, SLEEP <seconds>, PRIME <n>
 """
 
-import json
-import threading
+import collections
+import time
 
 # ---------------------------------------------------------------- constants
-SCHEDULER_PORT = 5000
+PORT = 5000
 ENCODING = "utf-8"
-MAX_MESSAGE_BYTES = 1024 * 1024
+MAX_LINE_BYTES = 64 * 1024
 RECV_CHUNK_SIZE = 4096
+HEARTBEAT_INTERVAL = 2.0     # workers send a heartbeat this often
+HEARTBEAT_TIMEOUT = 8.0      # silence for this long = worker dead
 
-# Message types
-SUBMIT_JOB = "SUBMIT_JOB"
-GET_JOB_STATUS = "GET_JOB_STATUS"
-GET_STATUS = "GET_STATUS"
-JOB_ACK = "JOB_ACK"
-JOB_STATUS = "JOB_STATUS"
-JOB_RESULT = "JOB_RESULT"
-STATUS = "STATUS"
-REGISTER_WORKER = "REGISTER_WORKER"
-REGISTER_ACK = "REGISTER_ACK"
+JOB_TYPES = ("REVERSE", "SUM", "SLEEP", "PRIME")
+
+# Verbs the scheduler receives
+SUBMIT = "SUBMIT"
+PING = "PING"
+QUIT = "QUIT"
+REGISTER = "REGISTER"
 HEARTBEAT = "HEARTBEAT"
-HEARTBEAT_ACK = "HEARTBEAT_ACK"
-ASSIGN_JOB = "ASSIGN_JOB"
-WORKER_RESULT = "WORKER_RESULT"
-ERROR = "ERROR"
+DONE = "DONE"
+FAIL = "FAIL"
 
-# Job statuses
+# Verbs the scheduler sends
+ACK = "ACK"
+RESULT = "RESULT"
+FAILED = "FAILED"
+ERROR = "ERROR"
+PONG = "PONG"
+REGISTERED = "REGISTERED"
+JOB = "JOB"
+
+# Job states (used inside the scheduler and in the status file)
 JOB_QUEUED = "QUEUED"
 JOB_RUNNING = "RUNNING"
 JOB_DONE = "DONE"
 JOB_FAILED = "FAILED"
 
-# Worker statuses
-WORKER_ALIVE = "ALIVE"
-WORKER_DEAD = "DEAD"
-
-JOB_TYPES = ("factorial", "reverse", "echo", "sleep")
-MAX_FACTORIAL_N = 100000
-MAX_SLEEP_SECONDS = 60
-MAX_WORKER_CAPACITY = 64
-
-# Required and optional fields for each message type: {field: python_type}
-REQUIRED_FIELDS = {
-    SUBMIT_JOB: {"job_type": str, "payload": dict},
-    GET_JOB_STATUS: {"job_id": int},
-    GET_STATUS: {},
-    JOB_ACK: {"job_id": int, "status": str},
-    JOB_STATUS: {"job_id": int, "status": str},
-    JOB_RESULT: {"job_id": int, "status": str},
-    STATUS: {},
-    REGISTER_WORKER: {"worker_id": str},
-    REGISTER_ACK: {"worker_id": str},
-    HEARTBEAT: {"worker_id": str},
-    HEARTBEAT_ACK: {"worker_id": str},
-    ASSIGN_JOB: {"job_id": int, "job_type": str, "payload": dict, "attempt": int},
-    WORKER_RESULT: {"worker_id": str, "job_id": int, "status": str},
-    ERROR: {"code": str, "message": str},
-}
-OPTIONAL_FIELDS = {
-    SUBMIT_JOB: {"client_id": str},
-    REGISTER_WORKER: {"capacity": int},
-}
+Message = collections.namedtuple("Message", "verb args")
 
 
 class ProtocolError(Exception):
-    """Raised for malformed / invalid messages.
+    """A bad or unreadable message.
 
-    fatal=True means the byte stream can no longer be trusted (for example a
-    line that is far too long) and the connection should be closed.
+    fatal=True means the stream can't be trusted any more (e.g. a huge line)
+    and the connection should be closed.
     """
 
     def __init__(self, message, fatal=False):
@@ -122,113 +80,23 @@ class ProtocolError(Exception):
         self.fatal = fatal
 
 
-# ---------------------------------------------------------------- validation
-def _is_type(value, expected):
-    """isinstance() that does not accept True/False as an int."""
-    if expected is int:
-        return isinstance(value, int) and not isinstance(value, bool)
-    return isinstance(value, expected)
+# ------------------------------------------------------------------ logging
+def log(who, message):
+    """Print a timestamped line, e.g.  12:00:01 [worker1] registered."""
+    print("%s [%s] %s" % (time.strftime("%H:%M:%S"), who, message), flush=True)
 
 
-def _is_number(value):
-    return isinstance(value, (int, float)) and not isinstance(value, bool)
+# ------------------------------------------------------------------ sending
+def send_line(sock, lock, text):
+    """Send one message line. `lock` may be None.
 
-
-def validate_job(job_type, payload):
-    """Check that job_type is known and the payload has the right shape."""
-    if job_type not in JOB_TYPES:
-        raise ProtocolError("unknown job_type %r (allowed: %s)"
-                            % (job_type, ", ".join(JOB_TYPES)))
-    if job_type == "factorial":
-        n = payload.get("n")
-        if not _is_type(n, int) or not 0 <= n <= MAX_FACTORIAL_N:
-            raise ProtocolError("factorial needs integer payload.n in 0..%d"
-                                % MAX_FACTORIAL_N)
-    elif job_type in ("reverse", "echo"):
-        if not isinstance(payload.get("text"), str):
-            raise ProtocolError("%s needs string payload.text" % job_type)
-    elif job_type == "sleep":
-        seconds = payload.get("seconds")
-        if not _is_number(seconds) or not 0 <= seconds <= MAX_SLEEP_SECONDS:
-            raise ProtocolError("sleep needs numeric payload.seconds in 0..%d"
-                                % MAX_SLEEP_SECONDS)
-
-
-def validate_message(msg):
-    """Raise ProtocolError unless msg is a well-formed protocol message."""
-    if not isinstance(msg, dict):
-        raise ProtocolError("message must be a JSON object")
-    msg_type = msg.get("type")
-    if not isinstance(msg_type, str):
-        raise ProtocolError("message has no string 'type' field")
-    if msg_type not in REQUIRED_FIELDS:
-        raise ProtocolError("unknown message type %r" % msg_type)
-
-    for field, expected in REQUIRED_FIELDS[msg_type].items():
-        if field not in msg:
-            raise ProtocolError("%s is missing required field '%s'"
-                                % (msg_type, field))
-        if not _is_type(msg[field], expected):
-            raise ProtocolError("%s field '%s' must be %s"
-                                % (msg_type, field, expected.__name__))
-    for field, expected in OPTIONAL_FIELDS.get(msg_type, {}).items():
-        if field in msg and not _is_type(msg[field], expected):
-            raise ProtocolError("%s field '%s' must be %s"
-                                % (msg_type, field, expected.__name__))
-
-    # Extra value checks
-    if msg_type in (SUBMIT_JOB, ASSIGN_JOB):
-        validate_job(msg["job_type"], msg["payload"])
-    if msg_type == REGISTER_WORKER:
-        if not msg["worker_id"].strip():
-            raise ProtocolError("worker_id must not be empty")
-        capacity = msg.get("capacity", 1)
-        if not 1 <= capacity <= MAX_WORKER_CAPACITY:
-            raise ProtocolError("capacity must be 1..%d" % MAX_WORKER_CAPACITY)
-    if msg_type == WORKER_RESULT and msg["status"] not in (JOB_DONE, JOB_FAILED):
-        raise ProtocolError("WORKER_RESULT status must be DONE or FAILED")
-
-
-# ------------------------------------------------------- encode / decode
-def make_message(msg_type, **fields):
-    """Build a message dict: make_message(HEARTBEAT, worker_id="w1")."""
-    msg = {"type": msg_type}
-    msg.update(fields)
-    return msg
-
-
-def encode_message(msg):
-    """dict -> bytes ending in newline. Validates first so bugs show early."""
-    validate_message(msg)
-    line = json.dumps(msg, separators=(",", ":"), ensure_ascii=True)
-    data = line.encode(ENCODING) + b"\n"
-    if len(data) > MAX_MESSAGE_BYTES:
-        raise ProtocolError("message too large (%d bytes)" % len(data))
-    return data
-
-
-def decode_message(raw):
-    """One line (bytes or str, with or without newline) -> validated dict."""
-    if isinstance(raw, (bytes, bytearray)):
-        try:
-            raw = bytes(raw).decode(ENCODING)
-        except UnicodeDecodeError:
-            raise ProtocolError("message is not valid UTF-8")
-    try:
-        msg = json.loads(raw)
-    except ValueError:
-        raise ProtocolError("message is not valid JSON")
-    validate_message(msg)
-    return msg
-
-
-# --------------------------------------------------------- socket helpers
-def send_message(sock, msg, lock=None):
-    """Encode and send one message. Pass a lock if several threads share sock.
-
-    Raises OSError on socket problems, ProtocolError on a bad message.
+    Newlines inside text are replaced by spaces so one message can never
+    become two. Raises OSError on socket problems.
     """
-    data = encode_message(msg)
+    text = " ".join(str(text).splitlines())
+    data = (text + "\n").encode(ENCODING)
+    if len(data) > MAX_LINE_BYTES:
+        raise ProtocolError("message too long (%d bytes)" % len(data))
     if lock is None:
         sock.sendall(data)
     else:
@@ -236,18 +104,19 @@ def send_message(sock, msg, lock=None):
             sock.sendall(data)
 
 
-class MessageReader:
-    """Reads newline-delimited messages from a socket (handles TCP framing).
+# ------------------------------------------------------------------ reading
+class LineReader:
+    """Reads newline-terminated lines from a socket (handles TCP framing).
 
-    TCP is a byte stream: one recv() may return half a message or several
-    messages. This class buffers bytes and splits them on "\\n".
+    One recv() can return half a line or several lines; this class buffers
+    bytes and splits them on "\\n".
 
-    read_message() returns:
-        dict  - one valid message
-        None  - the peer closed the connection (EOF)
+    read_line() returns:
+        str  - one non-empty line (without the newline)
+        None - the peer closed the connection (EOF)
     and raises:
-        ProtocolError - bad line (already consumed, you may keep reading;
-                        check .fatal to decide whether to give up)
+        ProtocolError - invalid UTF-8 (line already consumed, keep reading) or
+                        line too long (fatal=True, close the connection)
         socket.timeout / OSError - passed through from the socket
     """
 
@@ -255,22 +124,85 @@ class MessageReader:
         self.sock = sock
         self.buffer = bytearray()
 
-    def read_message(self):
+    def read_line(self):
         while True:
-            newline_pos = self.buffer.find(b"\n")
-            if newline_pos >= 0:
-                line = bytes(self.buffer[:newline_pos])
-                del self.buffer[:newline_pos + 1]
-                if not line.strip():
-                    continue  # ignore blank lines
-                return decode_message(line)
+            pos = self.buffer.find(b"\n")
+            if pos >= 0:
+                raw = bytes(self.buffer[:pos])
+                del self.buffer[:pos + 1]
+                if len(raw) > MAX_LINE_BYTES:
+                    raise ProtocolError("line too long", fatal=True)
+                try:
+                    text = raw.decode(ENCODING).strip()
+                except UnicodeDecodeError:
+                    raise ProtocolError("line is not valid UTF-8")
+                if not text:
+                    continue          # ignore blank lines
+                return text
 
-            if len(self.buffer) > MAX_MESSAGE_BYTES:
+            if len(self.buffer) > MAX_LINE_BYTES:
                 self.buffer.clear()
-                raise ProtocolError("line exceeds %d bytes without newline"
-                                    % MAX_MESSAGE_BYTES, fatal=True)
+                raise ProtocolError("line too long", fatal=True)
 
-            chunk = self.sock.recv(RECV_CHUNK_SIZE)  # may raise socket.timeout
+            chunk = self.sock.recv(RECV_CHUNK_SIZE)   # may raise socket.timeout
             if not chunk:
-                return None  # EOF; any partial line is discarded
+                return None           # EOF; a partial last line is discarded
             self.buffer.extend(chunk)
+
+
+# ------------------------------------------------------------------ parsing
+def _to_int(token, what):
+    try:
+        return int(token)
+    except ValueError:
+        raise ProtocolError("%s must be an integer, got %r" % (what, token))
+
+
+def parse_message(line):
+    """Turn one received line into Message(verb, args), or raise ProtocolError.
+
+    args by verb:
+        SUBMIT    (job_type, payload)      payload may be ""
+        REGISTER  (worker_id,)
+        HEARTBEAT (worker_id, active_jobs)
+        DONE      (job_id, output)
+        FAIL      (job_id, reason)
+        PING/QUIT ()
+    """
+    text = line.strip()
+    if not text:
+        raise ProtocolError("empty message")
+    verb = text.split(" ", 1)[0]
+
+    if verb == SUBMIT:
+        parts = text.split(" ", 2)
+        if len(parts) < 2 or not parts[1]:
+            raise ProtocolError("SUBMIT needs a job type: SUBMIT <TYPE> <payload>")
+        return Message(verb, (parts[1], parts[2].strip() if len(parts) > 2 else ""))
+
+    if verb == REGISTER:
+        parts = text.split()
+        if len(parts) != 2:
+            raise ProtocolError("usage: REGISTER <worker_id>")
+        return Message(verb, (parts[1],))
+
+    if verb == HEARTBEAT:
+        parts = text.split()
+        if len(parts) not in (2, 3):
+            raise ProtocolError("usage: HEARTBEAT <worker_id> <active_jobs>")
+        active = _to_int(parts[2], "active_jobs") if len(parts) == 3 else 0
+        if active < 0:
+            raise ProtocolError("active_jobs must not be negative")
+        return Message(verb, (parts[1], active))
+
+    if verb in (DONE, FAIL):
+        parts = text.split(" ", 2)
+        if len(parts) < 2:
+            raise ProtocolError("usage: %s <job_id> <text>" % verb)
+        return Message(verb, (_to_int(parts[1], "job_id"),
+                              parts[2] if len(parts) > 2 else ""))
+
+    if verb in (PING, QUIT):
+        return Message(verb, ())
+
+    raise ProtocolError("unknown command %r" % verb)
