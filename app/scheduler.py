@@ -10,6 +10,9 @@
   jobs are put back in the queue.
 * Writes worker/queue status to /tmp/sdn_status.json so the SDN controller
   can read it (application -> network integration hook).
+
+D2: --policy rr|least (round-robin or fewest active jobs); --job-timeout N (a job
+not finished after N s is sent to another worker); "[timing]" lines per job.
 """
 import argparse
 import itertools
@@ -54,8 +57,9 @@ class ClientConn:
 
 
 class Scheduler:
-    def __init__(self, host, port):
+    def __init__(self, host, port, policy="rr", job_timeout=10.0):
         self.host, self.port = host, port
+        self.policy, self.job_timeout = policy, job_timeout
         self.state = threading.Lock()
         self.workers = {}          # worker_id -> Worker
         self.order = []            # worker ids, used for round-robin
@@ -71,7 +75,8 @@ class Scheduler:
         srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         srv.bind((self.host, self.port))
         srv.listen(128)
-        log("sched", "listening on %s:%d" % (self.host, self.port))
+        log("sched", "listening on %s:%d (policy=%s, job-timeout=%gs)"
+            % (self.host, self.port, self.policy, self.job_timeout))
         for fn in (self.dispatch_loop, self.monitor_loop, self.status_loop):
             threading.Thread(target=fn, daemon=True).start()
         while True:
@@ -119,11 +124,13 @@ class Scheduler:
                 cc.send("ERROR unknown job type %s" % jtype)
                 return True
             jid = next(self.next_id)
+            t0 = time.time()
             with self.state:
                 self.jobs[jid] = {"client": cc, "type": jtype, "payload": payload,
-                                  "worker": None, "t0": time.time()}
+                                  "worker": None, "t0": t0, "sent": 0.0, "tried": set()}
                 self.stats["submitted"] += 1
             cc.send("ACK %d" % jid)
+            log("timing", "job=%d event=submitted t=%.3f" % (jid, t0))
             self.queue.put(jid)
             log("sched", "job %d %s submitted by %s:%d (queue=%d)"
                 % (jid, jtype, cc.addr[0], cc.addr[1], self.queue.qsize()))
@@ -144,10 +151,10 @@ class Scheduler:
             old = self.workers.get(wid)
         if old:
             self.remove_worker(old, "re-registered")
+        send_line(conn, w.lock, "REGISTERED %s" % wid)   # before the worker can get a JOB
         with self.state:
             self.workers[wid] = w
             self.order.append(wid)
-        send_line(conn, w.lock, "REGISTERED %s" % wid)
         log("sched", "worker %s registered from %s:%d (workers=%d)"
             % (wid, addr[0], addr[1], len(self.workers)))
         try:
@@ -192,9 +199,10 @@ class Scheduler:
     def finish_job(self, w, jid, output, ok):
         with self.state:
             job = self.jobs.pop(jid, None)
-            w.assigned.discard(jid)
-            w.active = max(0, w.active - 1)
-            if job is None:
+            if jid in w.assigned:              # not if the job was already taken back
+                w.assigned.discard(jid)
+                w.active = max(0, w.active - 1)
+            if job is None:                    # late duplicate result: ignore
                 return
             w.done += 1
             self.stats["completed" if ok else "failed"] += 1
@@ -203,15 +211,21 @@ class Scheduler:
         if not job["client"].send(msg):
             log("sched", "job %d finished but client is gone" % jid)
         log("sched", "job %d %s by %s in %.3fs" % (jid, "done" if ok else "FAILED", w.id, took))
+        log("timing", "job=%d event=finished worker=%s status=%s t=%.3f"
+            % (jid, w.id, "done" if ok else "failed", time.time()))
 
     # ------------------------------------------------------------ dispatch
-    def pick_worker(self):
+    def pick_worker(self, avoid=()):
+        """rr: next worker in turn. least: fewest active jobs (ties: next in turn).
+        Workers in `avoid` (they timed out on this job) are skipped if possible."""
         with self.state:
-            if not self.order:
+            n = len(self.order)
+            if n == 0:
                 return None
-            wid = self.order[self.rr % len(self.order)]
+            turn = [self.workers[self.order[(self.rr + i) % n]] for i in range(n)]
             self.rr += 1
-            return self.workers[wid]
+            pool = [w for w in turn if w.id not in avoid] or turn
+            return min(pool, key=lambda w: w.active) if self.policy == "least" else pool[0]
 
     def dispatch_loop(self):
         while True:
@@ -220,7 +234,7 @@ class Scheduler:
                 job = self.jobs.get(jid)
                 if job is None:
                     break
-                w = self.pick_worker()
+                w = self.pick_worker(job["tried"])
                 if w is None:
                     time.sleep(0.5)          # no workers yet: wait
                     continue
@@ -228,21 +242,38 @@ class Scheduler:
                     w.active += 1
                     w.assigned.add(jid)
                     job["worker"] = w.id
+                    job["sent"] = time.time()
                 try:
                     send_line(w.conn, w.lock, "JOB %d %s %s" % (jid, job["type"], job["payload"]))
                     log("sched", "job %d -> %s" % (jid, w.id))
+                    log("timing", "job=%d event=dispatched worker=%s t=%.3f" % (jid, w.id, job["sent"]))
                 except OSError:
                     self.remove_worker(w, "send failed")   # also requeues jid
                 break
 
     def monitor_loop(self):
         while True:
-            time.sleep(2)
+            time.sleep(1)
             now = time.time()
+            slow = []                          # jobs that took longer than --job-timeout
             with self.state:
                 dead = [w for w in self.workers.values() if now - w.last_seen > HEARTBEAT_TIMEOUT]
+                for jid, job in self.jobs.items():
+                    if job["worker"] is not None and now - job["sent"] > self.job_timeout:
+                        old = self.workers.get(job["worker"])
+                        if old is not None and jid in old.assigned:
+                            old.assigned.discard(jid)
+                            old.active = max(0, old.active - 1)
+                        slow.append((jid, job["worker"]))
+                        job["tried"].add(job["worker"])
+                        job["worker"] = None
+                        self.stats["requeued"] += 1
             for w in dead:
                 self.remove_worker(w, "heartbeat timeout")
+            for jid, wid in slow:              # send it to another worker
+                log("sched", "job %d timed out on %s; requeued" % (jid, wid))
+                log("timing", "job=%d event=timeout worker=%s t=%.3f" % (jid, wid, time.time()))
+                self.queue.put(jid)
 
     def status_loop(self):
         """Publish state for the SDN controller (integration hook)."""
@@ -271,9 +302,11 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="Job queue scheduler")
     ap.add_argument("--host", default="0.0.0.0")
     ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument("--policy", choices=["rr", "least"], default="rr")
+    ap.add_argument("--job-timeout", type=float, default=10.0, help="seconds")
     a = ap.parse_args()
     try:
-        Scheduler(a.host, a.port).serve()
+        Scheduler(a.host, a.port, a.policy, a.job_timeout).serve()
     except KeyboardInterrupt:
         pass
     

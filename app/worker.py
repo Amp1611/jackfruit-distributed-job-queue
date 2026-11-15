@@ -73,6 +73,7 @@ def run_once(args):
             active[0] += 1
         t0 = time.time()
         try:
+            time.sleep(args.slow)          # D2: simulate a slow worker (default 0)
             out = execute(jtype, payload)
             send_line(sock, lock, "DONE %s %s" % (jid, out))
             log(args.id, "job %s %s done in %.3fs" % (jid, jtype, time.time() - t0))
@@ -111,6 +112,7 @@ if __name__ == "__main__":
     ap.add_argument("--server", default="10.0.0.2")
     ap.add_argument("--port", type=int, default=PORT)
     ap.add_argument("--heartbeat", type=float, default=2.0)
+    ap.add_argument("--slow", type=float, default=0.0, help="extra seconds per job")
     a = ap.parse_args()
     try:
         while True:
